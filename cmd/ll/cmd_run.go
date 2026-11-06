@@ -12,6 +12,7 @@ import (
 )
 
 // pathList 是一个可以重复出现的字符串 flag，例如 -ro /usr -ro /lib。
+// 标准 flag 一个名字只能绑一个值（fs.String("ro", ...) 只能拿到最后一次）。要“可重复”就得让目标类型自己实现 flag.Value 接口（String() + Set(string)）
 type pathList []string
 
 func (p *pathList) String() string { return strings.Join(*p, ",") }
@@ -26,18 +27,20 @@ func (p *pathList) Set(v string) error {
 // 这就是容器运行时、systemd 的 ProtectSystem=、以及各种「沙箱执行器」
 // 使用 Landlock 的基本姿势。
 func cmdRun(args []string) {
+	// NewFlagSet 给 run 单独一套flag。
+	// flag.ExitOnError 的含义：解析出错时直接 os.Exit(2) 并打印 usage
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	var ro, rw pathList
-	fs.Var(&ro, "ro", "该路径可读+可执行（可重复，包含整棵子树）")
+	fs.Var(&ro, "ro", "该路径可读+可执行（可重复，包含整棵子树）") // 注册：名字 "ro" 绑定到 &ro
 	fs.Var(&rw, "rw", "该路径拥有全部权限（可重复，包含整棵子树）")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "用法: ll run [-ro PATH]... [-rw PATH]... -- CMD [ARGS...]")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(args); err != nil { // fs.Parse(args)解析：args 是 os.Args[2:]
 		fatal(err)
 	}
-	cmdline := fs.Args()
+	cmdline := fs.Args() // fs.Args()是剩余：非 flag 的那些参数
 	if len(cmdline) == 0 {
 		fs.Usage()
 		os.Exit(2)

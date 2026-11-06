@@ -36,6 +36,8 @@ Landlock 不是一个用户态库，而是 **Linux 内核里的 LSM（Linux Secu
 == 本内核支持的 scope（0x03） ==
 ```
 
+ABI 8 正好是 Linux 7.0 引入的（见 §2.6），所以 `7.0.14-linuxkit` 报 ABI 8 完全对得上 —— 这也是「查 ABI 比猜内核版本可靠」的现成例子。
+
 所以**不用再找 Linux 机器**了，直接：
 
 ```bash
@@ -172,14 +174,15 @@ Landlock 是 LSM，核心代码在 `security/landlock/`。它挂在这些 hook �
 | 4 | Linux 6.7 | `BIND_TCP` / `CONNECT_TCP` |
 | 5 | Linux 6.10 | `IOCTL_DEV` |
 | 6 | Linux 6.12 | `scoped`：抽象 unix socket、跨域发信号 |
-| 7 | 较新内核 | `restrict_self` 的 flags：审计日志开关 |
-| 8 | 较新内核 | `RESTRICT_SELF_TSYNC`：一次套到本进程所有线程 |
-| 9 | 更新内核 | `RESOLVE_UNIX`：限制连接「路径名」unix socket |
+| 7 | Linux 6.15 | `restrict_self` 的 flags：审计日志开关 |
+| 8 | Linux 7.0 | `RESTRICT_SELF_TSYNC`：一次套到本进程所有线程 |
+| 9 | Linux 7.1 | `RESOLVE_UNIX`：限制连接「路径名」unix socket |
 | 10 | 更新内核 | UDP：`BIND_UDP` / `CONNECT_SEND_UDP`；以及按对象关闭审计日志 |
 | 11 | 更新内核 | `RESTRICT_SELF_NO_NEW_PRIVS`：不必自己先 prctl |
 | 12 | 更新内核 | capability / namespace 限制（新的 rule 类型） |
 
-（7 以后的版本对应哪个内核 release 没有公认对照表，所以本项目只实现到 ABI 8 —— 也就是「本机实测过的那一版」。）
+对照表 1~9 取自 man-pages 6.19 的 `landlock(7)`；10 以后尚无公开对照表。
+本项目只实现到 ABI 8 —— 也就是本机实测过的那一版。
 
 注意：**「内核版本」和「ABI 版本」不是一回事**（发行版会 backport）。代码里只能信 `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)` 的返回值 —— 这就是 `landlock.SupportedFSAccess(abi)` 存在的理由。
 

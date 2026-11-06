@@ -51,10 +51,12 @@ type sandbox struct {
 	test  func()
 }
 
-// run 在父进程里调用：fork/exec 自己，把 apply+test 交给子进程。
+// run 在父进程里调用：fork并exec 自己，把 apply+test 交给子进程。
 func (s sandbox) run() {
+	// os.Args[0] 是当前程序自己的可执行文件路径，os.Args[1:] 是传给当前程序的所有参数。所以这行是“用同样的参数重新执行自己”
 	cmd := exec.Command(os.Args[0], os.Args[1:]...)
 	cmd.Env = append(os.Environ(), stageEnv+"="+s.stage)
+	// 把子进程的标准输入/输出/错误直接接到父进程的对应流上。这样父进程在终端运行，子进程的输出会直接显示在同一个终端里，交互也正常。
 	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
 	if len(s.extra) > 0 {
 		cmd.ExtraFiles = s.extra

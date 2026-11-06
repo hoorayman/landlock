@@ -41,11 +41,12 @@ const (
 	AccessFSRemoveFile                      // unlink
 	AccessFSMakeChar                        // mknod 字符设备
 	AccessFSMakeDir                         // mkdir
-	AccessFSMakeReg                         // O_CREAT 普通文件
+	AccessFSMakeReg                         // O_CREAT 普通文件（常规文件（Regular File）：也就是我们平时最常接触的，用来存文本、图片、代码、可执行程序的那种普通文件）
 	AccessFSMakeSock                        // bind unix socket（创建 socket 文件）
-	AccessFSMakeFifo                        // mkfifo
-	AccessFSMakeBlock                       // mknod 块设备
-	AccessFSMakeSym                         // symlink
+	AccessFSMakeFifo                        // mkfifo（FIFO（命名管道）：通过 mkfifo() 创建，会在文件系统里留下一个特殊文件。任何进程只要知道路径，就能打开它进行通信）
+	// Pipe（匿名管道）：通常指 pipe() 系统调用创建的对象，只能用于有亲缘关系的进程（如父子进程）之间通信。它没有文件系统路径，用完即毁
+	AccessFSMakeBlock // mknod 块设备
+	AccessFSMakeSym   // symlink
 
 	AccessFSRefer    // ABI 2（Linux 5.19）：跨目录 rename/link
 	AccessFSTruncate // ABI 3（Linux 6.2）：truncate / ftruncate / O_TRUNC
@@ -64,8 +65,41 @@ const (
 type Scope uint64
 
 const (
-	ScopeAbstractUnixSocket Scope = 1 << iota // ABI 6（Linux 6.12）：抽象命名空间的 unix socket
-	ScopeSignal                               // ABI 6（Linux 6.12）：给沙箱内外进程发信号
+	ScopeAbstractUnixSocket Scope = 1 << iota // ABI 6（Linux 6.12）：抽象命名空间的 unix socket（不允许沙箱里的进程连接到沙箱外部创建的“抽象 Unix 套接字”）
+	// 抽象 Unix 套接字：一种不依赖文件系统的本地通信方式，只需要一个名字，常用于服务端程序（比如数据库、容器运行时）与客户端程序之间的数据交换
+	// 服务端示例===================================================
+	// import socket
+	// import os
+
+	// # 创建套接字
+	// sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+	// # 关键点：用 \0 开头！这就是抽象命名空间
+	// # 注意：Python中不能用普通的字符串，必须用 bytes (b"\0...")
+	// abstract_address = b'\0my_abstract_service'
+
+	// # 绑定
+	// sock.bind(abstract_address)
+	// sock.listen(1)
+
+	// print("服务端启动，监听抽象地址...")
+	// conn, _ = sock.accept()
+	// print("收到:", conn.recv(1024).decode())
+	// conn.close()
+	// ===========================================================
+	// 客户端示例===================================================
+	// import socket
+
+	// sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+	// # 连接到同一个抽象地址
+	// sock.connect(b'\0my_abstract_service')
+
+	// sock.sendall(b"Hello from Python!")
+	// sock.close()
+	// ===========================================================
+
+	ScopeSignal // ABI 6（Linux 6.12）：给沙箱内外进程发信号
 )
 
 type fsAccessInfo struct {
@@ -195,7 +229,10 @@ type ABIChange struct {
 
 // ABIChanges 是 ABI 演进史。注意「内核版本」和「ABI 版本」不是一回事：
 // 发行版会把 Landlock 的补丁回合（backport）到老内核上，所以代码里必须查 ABI，
-// 不能靠 uname 猜。ABI 7 之后没有公认的版本对照表，同样只能查 ABI。
+// 不能靠 uname 猜。
+//
+// 内核版本一列取自 man-pages 的 landlock(7) VERSIONS 对照表（收至 ABI 9）；
+// 更新内核上的 ABI 10+ 尚无公开对照表，只能查 ABI。
 func ABIChanges() []ABIChange {
 	return []ABIChange{
 		{1, "5.13", "文件系统基础权限：EXECUTE / WRITE_FILE / READ_FILE / READ_DIR / REMOVE_* / MAKE_*"},
@@ -204,8 +241,8 @@ func ABIChanges() []ABIChange {
 		{4, "6.7", "网络：BIND_TCP / CONNECT_TCP"},
 		{5, "6.10", "IOCTL_DEV：设备文件的 ioctl"},
 		{6, "6.12", "scoped：抽象 unix socket、跨域发信号"},
-		{7, "—", "restrict_self 的 flags：控制是否为被拒行为记录审计日志"},
-		{8, "—", "LANDLOCK_RESTRICT_SELF_TSYNC：一次把规则套到本进程所有线程"},
+		{7, "6.15", "restrict_self 的 flags：控制是否为被拒行为记录审计日志"},
+		{8, "7.0", "LANDLOCK_RESTRICT_SELF_TSYNC：一次把规则套到本进程所有线程"},
 	}
 }
 
@@ -214,6 +251,7 @@ func FSAccessTable() [][3]string {
 	out := make([][3]string, 0, len(fsAccessInfos))
 	for _, i := range fsAccessInfos {
 		out = append(out, [3]string{i.name, fmt.Sprint(i.abi), fmt.Sprintf("0x%04x", uint64(i.flag))})
+		// 把数字转成十六进制，如果不足 4 位，前面用 0 补齐，最小宽度是4
 	}
 	return out
 }

@@ -24,6 +24,7 @@ const (
 	sysLandlockRestrictSelf  = 446
 )
 
+// 这一组常量是内核 ABI 里的魔法数字
 const (
 	// createRulesetVersion：size=0、flags=1 时不建规则集，只回问内核「你的 Landlock ABI 是第几版」。
 	createRulesetVersion = 1 << 0
@@ -84,6 +85,7 @@ func (s Support) Enabled() bool { return s.ABIErr == nil && s.ABI > 0 }
 
 // Detect 探测当前环境。这个函数本身不会修改任何状态，可以随便调。
 func Detect() Support {
+	// runtime.GOOS 和 runtime.GOARCH 返回的是编译该程序时所设定的目标操作系统和 CPU 架构
 	s := Support{GOOS: runtime.GOOS, GOARCH: runtime.GOARCH}
 
 	if b, err := os.ReadFile("/proc/sys/kernel/osrelease"); err == nil {
@@ -112,7 +114,7 @@ func (s Support) InLSMList() bool {
 	return false
 }
 
-// ABI 返回内核的 Landlock ABI 版本号。
+// ABI 返回内核的 Landlock ABI 版本号。内核有很多ABI，这里只返回 Landlock 的。
 //
 // 玩法很巧：landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)
 // 不创建任何东西，只把 ABI 版本号当作返回值吐出来。
@@ -145,6 +147,7 @@ type Ruleset struct {
 //
 // 这是 Landlock 最核心的语义，也是新手最容易误解的地方：
 // 它不是一个「默认全禁」的笼子，而是「你点名要管的权限，默认全禁，再按规则放行」。
+// 这个只是声明，没有启用实际控制，只有Restrict时候才控制，这一下才挂到进程上，即刻不可撤销
 func CreateRuleset(handledFS FSAccess, handledNet NetAccess, handledScoped Scope) (*Ruleset, error) {
 	attr := rulesetAttr{
 		handledAccessFS:  uint64(handledFS),
@@ -163,6 +166,8 @@ func CreateRuleset(handledFS FSAccess, handledNet NetAccess, handledScoped Scope
 
 	var lastErr error
 	for _, size := range sizes {
+		// syscall.Syscall：最多只能传递 3 个参数给内核。其函数签名固定为 (trap, a1, a2, a3 uintptr)。
+		// syscall.Syscall6：最多可以传递 6 个参数给内核。其函数签名扩展为 (trap, a1, a2, a3, a4, a5, a6 uintptr)。
 		fd, _, errno := syscall.Syscall6(sysLandlockCreateRuleset,
 			uintptr(unsafe.Pointer(&attr)), uintptr(size), 0, 0, 0, 0)
 		if errno == 0 {
@@ -184,6 +189,8 @@ func (r *Ruleset) Close() error {
 	if r.fd < 0 {
 		return nil
 	}
+	// syscall.Close(fd)：只做一件事——关闭传入的整数 fd。它不会更新 Go 层面的对象状态。
+	// os.File.Close()：在内部，它最终会调用 syscall.Close(file.fd)。但在此之前/之后，它会处理 Go 层面的清理工作，比如将 file.fd 置为 -1（防止重复关闭），并移除运行时终结器（finalizer）。
 	err := syscall.Close(r.fd)
 	r.fd = -1
 	return err
@@ -198,6 +205,8 @@ func (r *Ruleset) Close() error {
 //   - allowed 里的位必须都在 handled 里出现过，否则 EINVAL。
 func (r *Ruleset) AllowPath(path string, access FSAccess) error {
 	// 用 O_PATH 打开：只要目录的「身份」，不需要读写权限，也不需要额外权限。
+	// O_CLOEXEC确保了这个文件描述符在被 fork 出的子进程通过 execve 系列函数加载新程序时，会被自动关闭，不会泄露给新程序
+	// 参数0：权限参数。它仅在创建新文件（配合 O_CREAT）时生效，这里传 0 表示不涉及创建。
 	fd, err := syscall.Open(path, oPath|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return &os.PathError{Op: "open(O_PATH)", Path: path, Err: err}
@@ -239,7 +248,7 @@ func (r *Ruleset) AllowPort(port uint16, access NetAccess) error {
 //     文件 capability 提权，否则「沙箱里 exec 一个 setuid root 的程序」就成了逃逸通道。
 //     这也意味着沙箱内的一切 exec 都不再提权。
 //
-//  2. restrict_self 只会「叠加」规则：新 domain 与已有 domain 是取交集的关系。
+//  2. restrict_self 会生成Landlock domain，形成domain layers，每一层domain都会进行校验，有任意一层domain不满足就会拒绝执行。
 //     所以沙箱内的进程哪怕再调一次 restrict_self 加一个更宽松的规则集，
 //     也绝不可能拿回第一层拒绝掉的权限。唯一能改变规则的是 fork 出子进程之前，
 //     或者一开始就少管点——没有「解除」接口，这是 by design。
@@ -249,6 +258,11 @@ func (r *Ruleset) Restrict() error {
 	if r.fd < 0 {
 		return errors.New("landlock: 规则集已关闭")
 	}
+	// 必须先置位 no_new_privs：它是 restrict_self 的前置条件，不设会直接 EPERM。
+	// 作用是让沙箱内的 exec 再也无法通过 setuid/setgid、文件 capability 提权——
+	// 否则沙箱里的进程只要 exec 一个 setuid root 的程序就能拿到特权，
+	// 再用 mount / ptrace 这类 Landlock 管不到的能力逃出沙箱的假设。
+	// 副作用：沙箱里的 setuid 程序（sudo、passwd 之类）一律失效。
 	if _, _, errno := syscall.Syscall6(syscall.SYS_PRCTL, prSetNoNewPrivs, 1, 0, 0, 0, 0); errno != 0 {
 		return os.NewSyscallError("prctl(PR_SET_NO_NEW_PRIVS)", errno)
 	}
@@ -259,7 +273,14 @@ func (r *Ruleset) Restrict() error {
 	return r.Close()
 }
 
-// NoNewPrivs 读取 /proc/self/status 里的 NoNewPrivs 字段。
+// NoNewPrivs 读取 /proc/self/status 里的 NoNewPrivs 字段，用来复核内核侧的真实状态
+// （而不是只相信自己调用 prctl 成功了）。
+//
+// 等价的、不依赖 /proc 的写法是 prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0)（Linux 4.10+），
+// 返回值直接是 0/1、不经过 errno。这里选 /proc 只是为了更直观。
+//
+// 注意：no_new_privs 是 per-thread 的，/proc/self 指向的正是当前线程；Go 的 goroutine
+// 会在线程间迁移，所以严谨的沙箱要配合 runtime.LockOSThread 或 ABI 8 的 TSYNC。
 func NoNewPrivs() (bool, error) {
 	b, err := os.ReadFile("/proc/self/status")
 	if err != nil {
