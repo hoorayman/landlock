@@ -75,7 +75,7 @@ func main() {
 func runAll() {
 	for _, name := range []string{"abi", "fs", "net", "escape"} {
 		c := exec.Command(os.Args[0], name)
-		c.Stdout, c.Stderr = os.Stdout, os.Stderr
+		c.Stdout, c.Stderr = os.Stdout, os.Stderr // 因为 os/exec 默认不继承父进程的 stdio —— Stdout 为 nil 时，子进程的 stdout 会被接到 /dev/null。所有加这行，父进程就能看到每个演示的输出。
 		if err := c.Run(); err != nil {
 			fmt.Printf("\n(命令 %q 退出：%v)\n", name, err)
 		}

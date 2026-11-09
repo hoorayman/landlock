@@ -35,7 +35,7 @@ func cmdRun(args []string) {
 	fs.Var(&rw, "rw", "该路径拥有全部权限（可重复，包含整棵子树）")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "用法: ll run [-ro PATH]... [-rw PATH]... -- CMD [ARGS...]")
-		fs.PrintDefaults()
+		fs.PrintDefaults() // 这是 Go flag 包自带的“帮助文本生成器”：遍历这个 FlagSet 里注册过的所有 flag
 	}
 	if err := fs.Parse(args); err != nil { // fs.Parse(args)解析：args 是 os.Args[2:]
 		fatal(err)
@@ -73,7 +73,9 @@ func cmdRun(args []string) {
 		}
 	}
 
-	// 先解析出可执行文件的绝对路径（在某些 -ro 配置下，PATH 里只有部分目录可读）。
+	// execve 不做 PATH 查找，所以要先把 "sh" 这种裸名字解析成 "/bin/sh"。
+	// （Landlock 不管 stat，这一步放 Restrict 前后都能用；放前面更符合「先准备、后收窄」。）
+	// 注意：LookPath 按 $PATH 顺序搜索，PATH 里有可写目录时可能选中不该执行的二进制。
 	bin, err := exec.LookPath(cmdline[0])
 	if err != nil {
 		fatal(err)
