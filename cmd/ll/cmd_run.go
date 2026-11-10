@@ -34,6 +34,7 @@ func cmdRun(args []string) {
 	fs.Var(&ro, "ro", "该路径可读+可执行（可重复，包含整棵子树）") // 注册：名字 "ro" 绑定到 &ro
 	fs.Var(&rw, "rw", "该路径拥有全部权限（可重复，包含整棵子树）")
 	fs.Usage = func() {
+		// -- 的通用含义是"选项解析到此为止，后面的内容原样传递。至于后面是什么，取决于具体工具的设计。
 		fmt.Fprintln(os.Stderr, "用法: ll run [-ro PATH]... [-rw PATH]... -- CMD [ARGS...]")
 		fs.PrintDefaults() // 这是 Go flag 包自带的“帮助文本生成器”：遍历这个 FlagSet 里注册过的所有 flag
 	}
