@@ -60,7 +60,7 @@ grep -i landlock /boot/config-$(uname -r)  # CONFIG_SECURITY_LANDLOCK=y
 
 一句话：
 
-> **Landlock 让任何进程（包括非 root 进程）给自己和所有子孙进程戴上一套不可撤销、不可放宽的访问控制规则，作用范围是文件系统（按 inode 层级）、TCP 端口，以及（ABI 6+）信号和抽象 unix socket。**
+> **Landlock 让任何进程（包括非 root 进程）给当前线程和它之后 fork 出来的所有子孙进程戴上一套不可撤销、不可放宽的访问控制规则，作用范围是文件系统（按 inode 层级）、TCP 端口，以及（ABI 6+）信号和抽象 unix socket。**
 
 它解决的问题不是「防止 root 干坏事」（那是 SELinux/AppArmor 的活），而是 **「让程序给自己上枷锁」**：一个解析不可信 PDF 的进程、一个跑用户提交代码的 CI worker、一个容器运行时，可以在不需要任何特权的前提下，把「我接下来只能读这几个目录、只能写这个临时目录、只能连这个端口」写进内核，然后放心地去处理不可信输入。
 
@@ -87,7 +87,7 @@ Landlock 的用户态接口极简，编号在所有架构上一致（在 `asm-ge
 | --- | --- | --- |
 | 444 | `landlock_create_ruleset(attr, size, flags)` | 建一个「规则集」；`size=0, flags=1` 时只回问 ABI 版本 |
 | 445 | `landlock_add_rule(fd, rule_type, attr, flags)` | 往规则集里加一条规则（**没有 size 参数**，见 §7） |
-| 446 | `landlock_restrict_self(fd, flags)` | 把规则集钉到当前进程上，立即生效，不可撤销 |
+| 446 | `landlock_restrict_self(fd, flags)` | 把规则集钉到**当前线程**上，立即生效，不可撤销（per-thread，见 §2.7） |
 
 代码在 [`internal/landlock/landlock_linux.go`](internal/landlock/landlock_linux.go)：
 
@@ -107,14 +107,15 @@ scoped             = 0x...
   ruleset: { handled 集合 } + [ (路径/inode, 允许的权限位) ... ]
        │  landlock_restrict_self()
        ▼
-  当前进程的 Landlock domain ──fork/exec──► 所有子孙进程都继承
+  当前线程的 Landlock domain ──fork/exec──► 所有子孙进程都继承
        │
        │  再次 restrict_self 会再挂一层
        ▼
   layer 1 ─ layer 2 ─ ... （最多 16 层，判定时逐层都要通过 = 交集）
 ```
 
-- **规则集本身不生效**，`restrict_self` 之后才变成进程上的 domain。
+- **规则集本身不生效**，`restrict_self` 之后才变成线程上的 domain。
+- domain 只挂在**调用 restrict_self 的那个线程**上；同进程里已经存在的其它线程不受影响（§2.7）。
 - 一旦生效，**没有撤销接口**，也没有「放宽」接口。
 - 子进程 exec 之后，即使 exec 的是 setuid 程序，domain 也照样跟着（因为 `PR_SET_NO_NEW_PRIVS=1`，提权通道已关闭）。
 
@@ -186,6 +187,40 @@ Landlock 是 LSM，核心代码在 `security/landlock/`。它挂在这些 hook �
 
 注意：**「内核版本」和「ABI 版本」不是一回事**（发行版会 backport）。代码里只能信 `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)` 的返回值 —— 这就是 `landlock.SupportedFSAccess(abi)` 存在的理由。
 
+### 2.7 per-thread 语义：为什么 Go 里必须 `LockOSThread`
+
+`landlock_restrict_self` 的作用对象是**调用它的那个线程**，不是整个进程。
+
+内核里 domain 挂在 `struct cred` 上（`landlock_cred(cred)->domain`），`restrict_self` 内部走 `prepare_creds()` + `commit_creds()`，而 `commit_creds` 只替换当前线程的 `task->cred` 指针。同进程的其它线程各自持有自己的 `task->cred`，仍然指向旧的那个 cred 对象 —— 对它们来说沙箱根本不存在。
+
+| 对象 | 是否被限制 |
+| --- | --- |
+| 调用 `restrict_self` 的那个线程 | ✅ |
+| 该线程之后 clone 出来的线程（继承 cred 指针） | ✅ |
+| 该线程之后 fork/exec 出来的子孙进程 | ✅ |
+| 同进程里「之前就已存在」的其它线程 | ❌ |
+| 那些线程 fork 出来的子进程 | ❌ |
+
+`PR_SET_NO_NEW_PRIVS` 同理，也是 per-thread 的。
+
+**Go 的坑**：goroutine 不是线程，运行时会把它在 M 之间搬来搬去：
+
+- 阻塞式系统调用（往管道 `write`、`read`、`accept`……）会让出 M
+- Go 1.14+ 的异步抢占（SIGURG）可以在任意函数序言处让出 P，回来时可能落在另一个 M 上
+
+所以「`Restrict()` → 后续受限操作 / `execve`」之间的任何一次函数调用或 IO，都是潜在的迁移点。后果不是报错，而是**沙箱安静地失效**：
+
+- `ll run`：`Restrict()` 之后有一行 `fmt.Fprintf(os.Stderr, ...)`，stderr 是管道时（`| tee`、`> log 2>&1`）真的会阻塞。goroutine 若在这之后换了线程，`execve` 跑起来的程序就是完全不受限的，而「已生效」的提示早就打出来了。
+- `ll fs` / `ll escape`：`apply()` 和 `test()` 落在不同线程上，`cat secret.txt` 就会成功，`probe` 打出 `[放行]`，演示结论直接反过来。
+
+**对策**（本项目用的是第一种）：
+
+1. `runtime.LockOSThread()` —— 在 `Restrict()` **之前**调用，把 goroutine 钉死在当前线程；子进程套完沙箱、做完实验就退出，不需要 `UnlockOSThread`。`cmd/ll/probe.go` 的 `runChild()` 和 `cmd/ll/cmd_run.go` 都加了。
+2. ABI 8 的 `LANDLOCK_RESTRICT_SELF_TSYNC` —— `restrict_self` 的 flags 传 `1<<0`，一次性把 domain 同步到本进程所有线程。对 Go 这种天生多线程的运行时最省心，代价是要求内核 7.0+。
+3. 换个思路：把受限代码放进一个刚启动、还没多线程化的进程里做（runc 的 `nsexec.c` 坚持用 C 写、seccomp 的 `SECCOMP_FILTER_FLAG_TSYNC` 存在的理由完全一样）。
+
+> 一句话：**「进程」只是「线程」的便捷说法，内核里 `restrict_self` 只认线程。** 单线程 C 程序感觉不到这个区别，Go/Java 这类运行时必须显式处理。
+
 ---
 
 ## 3. 能做什么（真实用法）
@@ -216,7 +251,7 @@ hi
 1. 算出手臂（`SupportedFSAccess(abi)`）→ `CreateRuleset`
 2. 每个 `-ro` 路径加一条「读+列目录+执行」规则
 3. 每个 `-rw` 路径加一条「全部权限」规则
-4. `Restrict()` 之后 `execve` 目标程序（程序本身也是沙箱进程）
+4. `Restrict()` 之后 `execve` 目标程序（程序本身也是沙箱进程）—— 这两步必须在同一个 OS 线程上，所以前面要 `runtime.LockOSThread()`（§2.7）
 
 ---
 
@@ -246,12 +281,12 @@ internal/landlock/            核心库：三个系统调用的薄封装（无�
   landlock_test.go            纯逻辑单测（任何平台都能跑）
 cmd/ll/
   main.go                     命令分发；子进程入口拦截
-  probe.go                    「换进程做实验」的框架 + 输出辅助
+  probe.go                    「换进程做实验」的框架 + 输出辅助（子进程入口锁线程，见 §2.7）
   cmd_abi.go                  探测 ABI 与可用权限位
   cmd_fs.go                   文件系统三组对照实验
   cmd_net.go                  网络两组实验
   cmd_escape.go               绕过手法与边界
-  cmd_run.go                  沙箱执行器（最实用）
+  cmd_run.go                  沙箱执行器（最实用；Restrict 前锁线程，见 §2.7）
 Makefile                      make abi / fs / net / escape / all / run
 ```
 
@@ -335,8 +370,11 @@ r, err := landlock.CreateRuleset(landlock.SupportedFSAccess(abi), 0, 0)
 if err != nil { return err }
 r.AllowPath("/usr", landlock.AccessFSReadFile|landlock.AccessFSReadDir|landlock.AccessFSExecute)
 r.AllowPath("/tmp/work", landlock.SupportedFSAccess(abi))
+runtime.LockOSThread()                              // 必须：domain 是 per-thread 的（§2.7）
 if err := r.Restrict(); err != nil { return err }   // 从这里开始不可逆
 ```
+
+> 加了 `runtime.LockOSThread()` 就不要再 `UnlockOSThread()`：解锁后 goroutine 又会被搬走，沙箱留在原来那个线程上，你却在别的线程里裸奔。
 
 ---
 
@@ -354,6 +392,8 @@ if err := r.Restrict(); err != nil { return err }   // 从这里开始不可逆
    忘了它会得到 `EPERM`；设置之后，沙箱里所有 exec 都不再能通过 setuid 提权（这正是我们要的）。
 6. **演示必须换进程。**
    `restrict_self` 不可撤销，同一进程里连着做几组实验会互相污染；而且不换进程时，`net` 的「对照组」会跑在 sandbox 里，结论全错。
+7. **Landlock（和 `no_new_privs`）是 per-thread 的，Go 里不加 `runtime.LockOSThread()` 会偶发失效。**
+   `restrict_self` 只作用于调用它的线程，而 goroutine 会在 M 之间迁移。失败时的表现不是报错，而是「沙箱没生效」：`ll run` 执行起来的程序不受限、`ll escape` 把 `[拦截]` 印成 `[放行]`。这个 bug 复现概率低，但一旦出现，结论就是反的 —— 详见 §2.7。
 
 ---
 

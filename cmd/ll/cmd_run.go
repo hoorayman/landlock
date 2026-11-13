@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -82,6 +83,13 @@ func cmdRun(args []string) {
 		fatal(err)
 	}
 
+	// 关键：先把自己钉在这一个 OS 线程上，再 Restrict。
+	// restrict_self 是 per-thread 的（domain 挂在调用线程的 cred 上），而 goroutine
+	// 可能在 Restrict 和下面的 execve 之间被迁移到另一个线程 —— 那样 execve 用的是
+	// 那个线程的 cred，跑起来的程序完全没有沙箱。紧跟着的 Fprintf 在 stderr 是管道时
+	// 确实会阻塞，是一个很现实的迁移点。
+	// execve 成功后进程镜像被整体替换，不需要 UnlockOSThread。
+	runtime.LockOSThread()
 	if err := r.Restrict(); err != nil {
 		fatal(err)
 	}

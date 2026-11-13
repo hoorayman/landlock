@@ -253,7 +253,15 @@ func (r *Ruleset) AllowPort(port uint16, access NetAccess) error {
 //     也绝不可能拿回第一层拒绝掉的权限。唯一能改变规则的是 fork 出子进程之前，
 //     或者一开始就少管点——没有「解除」接口，这是 by design。
 //
-// 生效后，当前进程以及它 fork/exec 出来的所有子孙进程都受同一套规则约束。
+//  3. 只对「调用它的线程」生效（per-thread），不是整个进程。
+//     domain 存在 cred 里，restrict_self 走 prepare_creds/commit_creds，只替换当前线程的
+//     cred 指针；同进程里已经存在的其它线程仍指向旧 cred，完全不受影响。会被继承的只有：
+//     本线程、本线程之后 clone 出来的线程、本线程之后 fork/exec 出来的子孙进程。
+//     所以多线程调用方必须先 runtime.LockOSThread()，否则 goroutine 一迁移，
+//     后续操作就跑到没上锁的线程上了（表现为「沙箱悄悄失效」，不会报错）。
+//     ABI 8 的 LANDLOCK_RESTRICT_SELF_TSYNC（flags 传 1）可以一次性套到本进程所有线程。
+//
+// 生效后，调用线程以及它 fork/exec 出来的所有子孙进程都受同一套规则约束。
 func (r *Ruleset) Restrict() error {
 	if r.fd < 0 {
 		return errors.New("landlock: 规则集已关闭")
@@ -280,7 +288,8 @@ func (r *Ruleset) Restrict() error {
 // 返回值直接是 0/1、不经过 errno。这里选 /proc 只是为了更直观。
 //
 // 注意：no_new_privs 是 per-thread 的，/proc/self 指向的正是当前线程；Go 的 goroutine
-// 会在线程间迁移，所以严谨的沙箱要配合 runtime.LockOSThread 或 ABI 8 的 TSYNC。
+// 会在线程间迁移，所以严谨的沙箱要配合 runtime.LockOSThread 或 ABI 8 的 TSYNC
+// （和 Restrict 是同一个坑，见 Restrict 的第 3 条）。
 func NoNewPrivs() (bool, error) {
 	b, err := os.ReadFile("/proc/self/status")
 	if err != nil {

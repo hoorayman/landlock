@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -67,7 +68,15 @@ func (s sandbox) run() {
 }
 
 // runChild 在子进程里调用：应用沙箱 → 做实验 → 退出。
+//
+// 第一件事是 runtime.LockOSThread()：Landlock 的 domain 是 per-thread 的，
+// restrict_self 只作用于「调用它的那个线程」。goroutine 会在 M 之间迁移
+// （阻塞 syscall、异步抢占都会），一旦 apply() 和 test() 落在不同线程上，
+// test() 就是在没有沙箱的线程里跑的 —— 结果不是报错，而是把「拦截」显示成「放行」，
+// 演示结论直接反过来。锁住之后 apply/fork/exec 都在同一个线程上，才谈得上可信。
+// 子进程套完沙箱、做完实验就退出，所以不需要（也不应该）UnlockOSThread。
 func (s sandbox) runChild() {
+	runtime.LockOSThread()
 	if err := s.apply(); err != nil {
 		fmt.Printf("  !! 应用 Landlock 失败: %v\n", err)
 		os.Exit(1)
